@@ -1,0 +1,2 @@
+1. Give users a warnign to save their existing project before rewriting the new one
+2. Sometimes the files aren't in zip format, so how do we deal with that? maybe make it parse all the dependencies in the folder or something else? like show the entire folder not just blend files in google drive

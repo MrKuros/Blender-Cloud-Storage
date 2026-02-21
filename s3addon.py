@@ -1,11 +1,13 @@
 bl_info = {
-    "name": "Blender S3 Integration",
+    "name": "Blender Cloud Storage",
     "author": "Kashish aka MrKuros",
-    "version": (2, 0),
-    "blender": (4, 1, 0),
-    "location": "View3D > Tool Shelf > S3 Integration",
-    "description": "Upload and download Blender files to/from AWS S3",
+    "version": (3, 0),
+    "blender": (3, 0, 0),
+    "location": "View3D > Sidebar > Cloud",
+    "description": "Upload and download Blender files with dependencies to AWS S3 and Google Drive",
     "category": "Development",
+    "doc_url": "https://github.com/mrkuros/bloc",
+    "tracker_url": "https://github.com/mrkuros/bloc/issues",
 }
 
 import bpy
@@ -15,9 +17,10 @@ import shutil
 import tempfile
 import logging
 import subprocess
-import threading
+import pickle
+import platform
 
-# Set up logging
+# Setup logging
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 handler = logging.StreamHandler()
@@ -25,123 +28,188 @@ formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 handler.setFormatter(formatter)
 logger.addHandler(handler)
 
-REQUIRED_PACKAGES = ["boto3"]
+# Platform detection
+PLATFORM = platform.system()  # 'Windows', 'Darwin' (macOS), or 'Linux'
+logger.info(f"Platform: {PLATFORM}")
 
-# Global variables
+# Blender version info
+BLENDER_VERSION = bpy.app.version
+BLENDER_VERSION_STRING = f"{BLENDER_VERSION[0]}.{BLENDER_VERSION[1]}.{BLENDER_VERSION[2]}"
+logger.info(f"Blender Cloud Storage v3.0 loading on Blender {BLENDER_VERSION_STRING}")
+
+# Package requirements
+REQUIRED_PACKAGES = [
+    "google-auth==2.35.0",
+    "google-auth-httplib2==0.2.0",
+    "google-auth-oauthlib==1.2.0",
+    "google-api-python-client==2.147.0",
+    "boto3"
+]
+
+# Google Drive API scope
+# Using 'drive' scope to see ALL your Drive files (including existing ones)
+# 'drive.file' would only show files created by this app
+SCOPES = ['https://www.googleapis.com/auth/drive']
+
+# Global state
 s3_client = None
+drive_service = None
 packages_installed = False
 
 def get_modules_path():
-    """Get the Blender user modules path."""
-    return bpy.utils.user_resource("SCRIPTS", path="modules", create=True)
+    """Get Blender modules path."""
+    modules_path = bpy.utils.user_resource("SCRIPTS", path="modules", create=True)
+    logger.info(f"Modules path: {modules_path}")
+    return modules_path
 
-def append_modules_to_sys_path(modules_path):
-    """Add modules path to sys.path if not already present."""
-    if modules_path not in sys.path:
-        sys.path.append(modules_path)
+def get_credentials_path():
+    """Get path for storing credentials."""
+    scripts_path = bpy.utils.user_resource("SCRIPTS", create=True)
+    creds_dir = os.path.join(scripts_path, "addons", "cloud_storage_data")
+    os.makedirs(creds_dir, exist_ok=True)
+    return creds_dir
 
-def check_packages_installed():
-    """Check if all required packages are installed."""
-    for package in REQUIRED_PACKAGES:
-        try:
-            __import__(package)
-        except ImportError:
+def get_install_flag_path():
+    """Get path for package installation flag."""
+    return os.path.join(get_credentials_path(), ".packages_v3")
+
+def are_packages_installed():
+    """Check if packages are already installed."""
+    return os.path.exists(get_install_flag_path())
+
+def mark_packages_installed():
+    """Mark packages as installed."""
+    with open(get_install_flag_path(), 'w') as f:
+        f.write("v3.0")
+
+def install_packages(modules_path):
+    """Install all required packages."""
+    logger.info("=" * 60)
+    logger.info("INSTALLING PACKAGES")
+    logger.info("=" * 60)
+    
+    try:
+        # Install all packages in one command
+        cmd = [sys.executable, "-m", "pip", "install", "--target", modules_path, "--upgrade"] + REQUIRED_PACKAGES
+        
+        logger.info("Running: " + " ".join(cmd))
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if result.returncode == 0:
+            logger.info("=" * 60)
+            logger.info("✓ PACKAGES INSTALLED SUCCESSFULLY")
+            logger.info("=" * 60)
+            logger.info("RESTART BLENDER NOW!")
+            logger.info("=" * 60)
+            return True
+        else:
+            logger.error("Installation failed:")
+            logger.error(result.stderr)
             return False
-    return True
+    except Exception as e:
+        logger.error(f"Installation error: {e}")
+        return False
 
-def install_packages_sync(packages, modules_path):
-    """Install required packages synchronously."""
-    for package in packages:
-        try:
-            __import__(package)
-            logger.info(f"'{package}' is already installed.")
-        except ImportError:
-            logger.info(f"Installing '{package}'...")
-            try:
-                subprocess.check_call([
-                    sys.executable,
-                    "-m",
-                    "pip",
-                    "install",
-                    "--upgrade",
-                    "--target",
-                    modules_path,
-                    package
-                ])
-                logger.info(f"'{package}' installed successfully.")
-            except subprocess.CalledProcessError as e:
-                logger.error(f"Failed to install '{package}'. Error: {e}")
-                return False
-    return True
-
-# Initialize modules path and install packages
+# Initialize modules path
 modules_path = get_modules_path()
-append_modules_to_sys_path(modules_path)
+if modules_path not in sys.path:
+    sys.path.append(modules_path)
 
-# Try to install packages if not already installed
-if not check_packages_installed():
-    logger.info("Installing required packages...")
-    packages_installed = install_packages_sync(REQUIRED_PACKAGES, modules_path)
+# Check and install packages
+if not are_packages_installed():
+    logger.info("First time setup - installing packages...")
+    if install_packages(modules_path):
+        mark_packages_installed()
+        packages_installed = False  # Need restart
+    else:
+        logger.error("Package installation failed")
+        packages_installed = False
 else:
-    packages_installed = True
-    logger.info("All required packages are already installed.")
+    # Try to import packages
+    try:
+        import google.auth
+        import boto3
+        from google_auth_oauthlib.flow import InstalledAppFlow
+        from googleapiclient.discovery import build
+        
+        packages_installed = True
+        logger.info(f"✓ Packages ready (google-auth {google.auth.__version__})")
+    except ImportError as e:
+        logger.error(f"Import failed: {e}")
+        logger.error("Remove the flag file and restart:")
+        logger.error(f"  rm {get_install_flag_path()}")
+        packages_installed = False
 
-# Import boto3 after ensuring it's installed
+# Import packages if available
 if packages_installed:
     try:
         import boto3
         from botocore.exceptions import NoCredentialsError
-    except ImportError:
-        logger.error("Failed to import boto3. Please restart Blender.")
+        from google.auth.transport.requests import Request
+        from google.oauth2.credentials import Credentials
+        from google_auth_oauthlib.flow import InstalledAppFlow
+        from googleapiclient.discovery import build
+        from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
+        import google.auth
+    except ImportError as e:
+        logger.error(f"Import error: {e}")
         packages_installed = False
 
-class S3IntegrationPreferences(bpy.types.AddonPreferences):
-    bl_idname = __name__
+#
+# HELPER FUNCTIONS
+#
 
-    access_key: bpy.props.StringProperty(
-        name="Access Key",
-        description="AWS Access Key",
-        default="",
-        subtype='PASSWORD'
-    )
-    secret_key: bpy.props.StringProperty(
-        name="Secret Key",
-        description="AWS Secret Key",
-        default="",
-        subtype='PASSWORD'
-    )
-    region_name: bpy.props.StringProperty(
-        name="Region Name",
-        description="AWS Region Name",
-        default="us-west-2"
-    )
-    bucket_name: bpy.props.StringProperty(
-        name="Bucket Name",
-        description="S3 Bucket Name",
-        default=""
-    )
+def is_gdrive_authenticated():
+    """Check if Google Drive is authenticated."""
+    token_path = os.path.join(get_credentials_path(), "gdrive_token.pickle")
+    if not os.path.exists(token_path):
+        return False
+    try:
+        with open(token_path, 'rb') as token:
+            creds = pickle.load(token)
+        
+        if not creds or not creds.valid:
+            if creds and creds.expired and creds.refresh_token:
+                try:
+                    creds.refresh(Request())
+                    return True
+                except Exception:
+                    # Token refresh failed
+                    return False
+            return False
+        
+        return True
+    except Exception as e:
+        logger.error(f"Auth check error: {e}")
+        return False
 
-    def draw(self, context):
-        """Draw the preferences UI."""
-        layout = self.layout
-        
-        if not packages_installed:
-            layout.label(text="Required packages not installed!", icon='ERROR')
-            layout.label(text="Please restart Blender to complete installation.")
-            return
-        
-        layout.prop(self, "access_key")
-        layout.prop(self, "secret_key")
-        layout.prop(self, "region_name")
-        layout.prop(self, "bucket_name")
+def get_gdrive_credentials():
+    """Get Google Drive credentials."""
+    creds = None
+    token_path = os.path.join(get_credentials_path(), "gdrive_token.pickle")
+    
+    if os.path.exists(token_path):
+        with open(token_path, 'rb') as token:
+            creds = pickle.load(token)
+    
+    if creds and creds.expired and creds.refresh_token:
+        try:
+            creds.refresh(Request())
+            with open(token_path, 'wb') as token:
+                pickle.dump(creds, token)
+        except Exception as e:
+            logger.error(f"Token refresh failed: {e}")
+            if os.path.exists(token_path):
+                os.remove(token_path)
+            return None
+    
+    return creds
 
 def initialize_s3_client():
-    """Initialize the S3 client."""
+    """Initialize S3 client."""
     global s3_client
     if not packages_installed:
-        logger.error("Cannot initialize S3 client: boto3 not installed")
         return False
-    
     prefs = bpy.context.preferences.addons[__name__].preferences
     s3_client = boto3.client(
         's3',
@@ -151,11 +219,54 @@ def initialize_s3_client():
     )
     return True
 
-def list_files_in_bucket(bucket):
-    """List all files in an S3 bucket."""
+def initialize_gdrive_service():
+    """Initialize Google Drive service."""
+    global drive_service
+    if not packages_installed:
+        return False
+    creds = get_gdrive_credentials()
+    if not creds or not creds.valid:
+        return False
+    drive_service = build('drive', 'v3', credentials=creds)
+    return True
+
+def gather_dependencies(blend_file_path):
+    """Gather all dependencies for a blend file."""
+    base_dir = os.path.dirname(blend_file_path)
+    package_dir_name = "package_" + os.path.basename(blend_file_path).split('.')[0]
+    package_dir = os.path.join(tempfile.gettempdir(), package_dir_name)
+    os.makedirs(package_dir, exist_ok=True)
+    
+    # Copy blend file
+    shutil.copy(blend_file_path, package_dir)
+    
+    # Gather dependencies
+    dependencies = set()
+    for library in bpy.data.libraries:
+        dependencies.add(bpy.path.abspath(library.filepath))
+    for image in bpy.data.images:
+        if image.filepath:
+            dependencies.add(bpy.path.abspath(image.filepath))
+    
+    # Copy dependencies
+    for dep in dependencies:
+        if not os.path.exists(dep):
+            continue
+        rel_path = os.path.relpath(dep, base_dir)
+        dep_dest = os.path.join(package_dir, rel_path)
+        os.makedirs(os.path.dirname(dep_dest), exist_ok=True)
+        shutil.copy(dep, dep_dest)
+    
+    return package_dir
+
+#
+# S3 FUNCTIONS
+#
+
+def list_files_in_s3(bucket):
+    """List files in S3 bucket."""
     if not packages_installed:
         return []
-    
     files = []
     try:
         prefs = bpy.context.preferences.addons[__name__].preferences
@@ -168,294 +279,1135 @@ def list_files_in_bucket(bucket):
         my_bucket = s3_resource.Bucket(bucket)
         files = [obj.key for obj in my_bucket.objects.all()]
     except Exception as e:
-        logger.error(f"Error listing files: {e}")
+        logger.error(f"S3 list error: {e}")
     return files
 
-def gather_dependencies(blend_file_path):
-    """Gather all dependencies of the blend file and copy them to a new folder."""
-    base_dir = os.path.dirname(blend_file_path)
-    package_dir_name = "package_" + os.path.basename(blend_file_path).split('.')[0]
-    package_dir = os.path.join(tempfile.gettempdir(), package_dir_name)
-
-    # Create a new directory to store the blend file and dependencies
-    os.makedirs(package_dir, exist_ok=True)
-
-    # Copy the blend file while preserving the relative path
-    shutil.copy(blend_file_path, package_dir)
-
-    # List to store paths of dependencies
-    dependencies = set()
-
-    # Add all linked libraries
-    for library in bpy.data.libraries:
-        dependencies.add(bpy.path.abspath(library.filepath))
-
-    # Add all image filepaths (textures)
-    for image in bpy.data.images:
-        if image.filepath:
-            dependencies.add(bpy.path.abspath(image.filepath))
-
-    # Copy all dependencies to the new directory, preserving the relative paths
-    for dep in dependencies:
-        rel_path = os.path.relpath(dep, base_dir)
-        dep_dest = os.path.join(package_dir, rel_path)
-        os.makedirs(os.path.dirname(dep_dest), exist_ok=True)
-        shutil.copy(dep, dep_dest)
-
-    return package_dir
-
-def upload_folder_to_s3(folder, bucket, s3_key):
-    """Upload a folder to AWS S3 without zipping."""
+def upload_to_s3(folder, bucket, s3_key):
+    """Upload folder to S3."""
     if not packages_installed:
-        logger.error("Cannot upload: boto3 not installed")
         return False
-    
     try:
         for root, dirs, files in os.walk(folder):
             for file in files:
                 local_file_path = os.path.join(root, file)
                 s3_file_path = os.path.relpath(local_file_path, folder)
-                s3_file_path = os.path.join(s3_key, s3_file_path)
+                s3_file_path = os.path.join(s3_key, s3_file_path).replace("\\", "/")
                 s3_client.upload_file(local_file_path, bucket, s3_file_path)
-                logger.info(f"Uploaded {local_file_path} to {s3_file_path} in {bucket}")
-        logger.info(f"Uploaded {folder} to {s3_key} in {bucket}")
         return True
-    except NoCredentialsError:
-        logger.error("Credentials not available")
-        return False
     except Exception as e:
-        logger.error(f"An error occurred: {e}")
+        logger.error(f"S3 upload error: {e}")
         return False
 
 def download_from_s3(bucket, s3_key, local_dir):
-    """Download a file from AWS S3 to a local directory, ensuring correct path structure."""
+    """Download from S3."""
     if not packages_installed:
-        logger.error("Cannot download: boto3 not installed")
         return False
-    
     try:
-        # Get the filename from the S3 key and ensure proper path
         file_name = os.path.basename(s3_key)
         local_file_path = os.path.join(local_dir, file_name)
-
-        # Ensure parent directory exists
         os.makedirs(os.path.dirname(local_file_path), exist_ok=True)
-
-        # Download the file
-        logger.info(f"Downloading {s3_key} from bucket {bucket} to {local_file_path}")
         s3_client.download_file(bucket, s3_key, local_file_path)
-        logger.info(f"Downloaded {s3_key} to {local_file_path}")
-        
         return local_file_path
-    except NoCredentialsError:
-        logger.error("Credentials not available")
-        return False
     except Exception as e:
-        logger.error(f"An error occurred: {e}")
+        logger.error(f"S3 download error: {e}")
         return False
 
-def load_s3_file_into_blender(file_name):
-    """Download and load an S3 file into Blender."""
+def delete_from_s3(bucket, s3_file):
+    """Delete from S3."""
     if not packages_installed:
-        logger.error("Cannot load file: boto3 not installed")
-        return
-    
-    try:
-        temp_dir = os.path.join(tempfile.gettempdir(), "blender_s3_package", "skinmodel")
-        os.makedirs(temp_dir, exist_ok=True)
-
-        # Ensure S3 client is initialized
-        initialize_s3_client()
-
-        # Download the file
-        downloaded_file = download_from_s3(
-            bpy.context.preferences.addons[__name__].preferences.bucket_name,
-            file_name,
-            temp_dir
-        )
-        
-        if not downloaded_file or not os.path.exists(downloaded_file):
-            raise FileNotFoundError(f"Failed to download {file_name} from S3.")
-        
-        # Load the downloaded file into Blender
-        bpy.ops.wm.open_mainfile(filepath=downloaded_file)
-        logger.info("File Loaded Successfully")
-    except NoCredentialsError:
-        logger.error("Credentials not available")
-    except FileNotFoundError as e:
-        logger.error(str(e))
-    except Exception as e:
-        logger.error(f"An error occurred: {e}")
-
-def delete_file_from_s3(bucket, s3_file):
-    """Delete a file from AWS S3."""
-    if not packages_installed:
-        logger.error("Cannot delete: boto3 not installed")
         return False
-    
     try:
         s3_client.delete_object(Bucket=bucket, Key=s3_file)
-        logger.info(f"Deleted {s3_file} from {bucket}")
         return True
     except Exception as e:
-        logger.error(f"Failed to delete {s3_file}: {e}")
+        logger.error(f"S3 delete error: {e}")
         return False
 
-class S3IntegrationPanel(bpy.types.Panel):
-    bl_label = "S3 Integration"
-    bl_idname = "OBJECT_PT_s3integration"
-    bl_space_type = 'VIEW_3D'
-    bl_region_type = 'UI'
-    bl_category = "S3 Integration"
+#
+# GOOGLE DRIVE FUNCTIONS
+#
+
+def list_files_in_gdrive(folder_id=None):
+    """List files in Google Drive."""
+    if not packages_installed or not drive_service:
+        return []
+    files = []
+    try:
+        # Query for .blend and .zip files
+        query = "(name contains '.blend' or name contains '.zip') and trashed=false"
+        if folder_id:
+            query += f" and '{folder_id}' in parents"
+        
+        logger.info(f"Listing files with query: {query}")
+        
+        # Handle pagination
+        files = []
+        page_token = None
+        
+        while True:
+            results = drive_service.files().list(
+                q=query,
+                fields="nextPageToken, files(id, name, mimeType, modifiedTime)",
+                orderBy="modifiedTime desc",
+                pageSize=1000,
+                pageToken=page_token,
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True
+            ).execute()
+            
+            files.extend(results.get('files', []))
+            page_token = results.get('nextPageToken')
+            
+            if not page_token:
+                break
+        
+        logger.info(f"Found {len(files)} files in Drive")
+        
+        # Log first 10 files
+        for i, f in enumerate(files[:10]):
+            logger.info(f"  {i+1}. {f['name']} ({f.get('mimeType', 'unknown')})")
+        
+    except Exception as e:
+        logger.error(f"GDrive list error: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+    return files
+
+def list_shared_files():
+    """List ALL files shared with you (for debugging)."""
+    if not packages_installed or not drive_service:
+        return []
+    
+    try:
+        logger.info("Listing ALL shared files...")
+        
+        # List everything shared with you
+        results = drive_service.files().list(
+            q="sharedWithMe=true and trashed=false",
+            fields="files(id, name, mimeType, modifiedTime, owners)",
+            orderBy="modifiedTime desc",
+            pageSize=100,
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True
+        ).execute()
+        
+        all_files = results.get('files', [])
+        logger.info(f"Total shared files: {len(all_files)}")
+        
+        # Log all files
+        for i, f in enumerate(all_files[:50]):  # First 50
+            owner = f.get('owners', [{}])[0].get('displayName', 'Unknown')
+            logger.info(f"  {i+1}. {f['name']} ({f.get('mimeType')}) by {owner}")
+        
+        # Filter for .blend and .zip
+        blend_files = [f for f in all_files if f['name'].lower().endswith(('.blend', '.zip'))]
+        logger.info(f"Found {len(blend_files)} .blend/.zip files")
+        
+        return blend_files
+        
+    except Exception as e:
+        logger.error(f"Error listing shared files: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return []
+
+def upload_to_gdrive(file_path, folder_id=None):
+    """Upload file to Google Drive as zip."""
+    if not packages_installed or not drive_service:
+        return False
+    try:
+        import zipfile
+        import io
+        
+        # If it's a folder, zip it
+        if os.path.isdir(file_path):
+            zip_buffer = io.BytesIO()
+            with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+                for root, dirs, files in os.walk(file_path):
+                    for file in files:
+                        file_path_full = os.path.join(root, file)
+                        arcname = os.path.relpath(file_path_full, file_path)
+                        zip_file.write(file_path_full, arcname)
+            
+            zip_buffer.seek(0)
+            zip_name = os.path.basename(file_path) + ".zip"
+            
+            file_metadata = {'name': zip_name, 'mimeType': 'application/zip'}
+            if folder_id:
+                file_metadata['parents'] = [folder_id]
+            
+            from googleapiclient.http import MediaIoBaseUpload
+            media = MediaIoBaseUpload(zip_buffer, mimetype='application/zip', resumable=True)
+            drive_service.files().create(body=file_metadata, media_body=media, fields='id').execute()
+            return True
+        else:
+            # Single file
+            file_name = os.path.basename(file_path)
+            file_metadata = {'name': file_name}
+            if folder_id:
+                file_metadata['parents'] = [folder_id]
+            media = MediaFileUpload(file_path, resumable=True)
+            drive_service.files().create(body=file_metadata, media_body=media, fields='id').execute()
+            return True
+    except Exception as e:
+        logger.error(f"GDrive upload error: {e}")
+        return False
+
+def extract_dependencies_from_blend(blend_path):
+    """Extract actual dependency paths from a .blend file."""
+    import struct
+    
+    dependencies = set()
+    
+    try:
+        if not os.path.exists(blend_path):
+            logger.error(f"Blend file not found: {blend_path}")
+            return dependencies
+        
+        # Check file size - skip parsing if too large (>500MB)
+        file_size = os.path.getsize(blend_path)
+        if file_size > 500 * 1024 * 1024:  # 500 MB
+            logger.warning(f"Blend file is very large ({file_size / (1024*1024):.1f} MB)")
+            logger.warning("Skipping dependency parsing for safety")
+            logger.warning("Please upload this file in a dedicated folder with dependencies")
+            return dependencies
+        
+        with open(blend_path, 'rb') as f:
+            # Read file header
+            header = f.read(12)
+            if not header.startswith(b'BLENDER'):
+                logger.error("Not a valid .blend file")
+                return dependencies
+            
+            # Read the rest of the file and look for file paths
+            # Blender stores paths as null-terminated strings
+            content = f.read()
+            
+            # Look for common path patterns
+            # Images/textures typically have extensions
+            import re
+            
+            # Find paths with common extensions
+            extensions = [
+                b'.png', b'.jpg', b'.jpeg', b'.tga', b'.tiff', b'.exr', b'.hdr',
+                b'.mp4', b'.mov', b'.avi', b'.blend'
+            ]
+            
+            for ext in extensions:
+                # Find all occurrences of this extension
+                pos = 0
+                while True:
+                    pos = content.find(ext, pos)
+                    if pos == -1:
+                        break
+                    
+                    # Try to extract the full path before this extension
+                    # Look backwards to find the start of the path
+                    start = pos
+                    while start > 0 and content[start-1:start] not in [b'\x00', b'\n', b'\r']:
+                        start -= 1
+                        if pos - start > 500:  # Reasonable path length limit
+                            break
+                    
+                    # Extract the path
+                    path_bytes = content[start:pos + len(ext)]
+                    try:
+                        path = path_bytes.decode('utf-8', errors='ignore')
+                        # Clean up the path
+                        path = path.strip('\x00\n\r\t ')
+                        
+                        # Filter out obviously invalid paths
+                        if len(path) > 3 and '/' in path or '\\' in path:
+                            # Normalize path separators
+                            path = path.replace('\\', '/')
+                            
+                            # Extract just the filename and relative path
+                            # Skip absolute paths, keep relative ones
+                            if not path.startswith('/') and ':' not in path:
+                                dependencies.add(path)
+                            elif path.startswith('//'):
+                                # Blender relative path
+                                dependencies.add(path[2:])  # Remove //
+                    except (UnicodeDecodeError, ValueError):
+                        # Invalid path data, skip it
+                        pass
+                    
+                    pos += 1
+        
+        logger.info(f"Extracted {len(dependencies)} dependencies from .blend file:")
+        for dep in sorted(dependencies):
+            logger.info(f"  - {dep}")
+        
+        return dependencies
+        
+    except Exception as e:
+        logger.error(f"Error parsing .blend file: {e}")
+        return dependencies
+
+def download_from_gdrive(file_id, local_dir):
+    """Download and extract from Google Drive."""
+    if not packages_installed or not drive_service:
+        return False
+    try:
+        import zipfile
+        
+        # Get file metadata (including parent folder)
+        file_metadata = drive_service.files().get(
+            fileId=file_id,
+            fields='id, name, parents'
+        ).execute()
+        file_name = file_metadata.get('name')
+        
+        logger.info(f"Downloading: {file_name}")
+        
+        # Download file
+        temp_file = os.path.join(tempfile.gettempdir(), file_name)
+        request = drive_service.files().get_media(fileId=file_id)
+        
+        with open(temp_file, 'wb') as fh:
+            downloader = MediaIoBaseDownload(fh, request)
+            done = False
+            while not done:
+                status, done = downloader.next_chunk()
+        
+        # If zip, extract it
+        if file_name.endswith('.zip'):
+            extract_dir = os.path.join(local_dir, file_name[:-4])
+            os.makedirs(extract_dir, exist_ok=True)
+            
+            with zipfile.ZipFile(temp_file, 'r') as zip_ref:
+                zip_ref.extractall(extract_dir)
+            
+            os.remove(temp_file)
+            
+            # Find .blend file
+            for root, dirs, files in os.walk(extract_dir):
+                for file in files:
+                    if file.endswith('.blend'):
+                        return os.path.join(root, file)
+            
+            return None
+        
+        # If it's a .blend file (not zipped), download dependencies from same folder
+        elif file_name.endswith('.blend'):
+            logger.info("Non-zipped .blend file detected - analyzing dependencies...")
+            
+            # Create a directory for this project
+            project_name = file_name[:-6]  # Remove .blend
+            project_dir = os.path.join(local_dir, project_name)
+            os.makedirs(project_dir, exist_ok=True)
+            
+            # Move the blend file to project directory
+            blend_path = os.path.join(project_dir, file_name)
+            shutil.move(temp_file, blend_path)
+            
+            # Parse the .blend file to find actual dependencies
+            dependencies = extract_dependencies_from_blend(blend_path)
+            
+            if not dependencies:
+                logger.info("No external dependencies found in .blend file")
+                return blend_path
+            
+            # Get the parent folder of this file
+            parents = file_metadata.get('parents', [])
+            
+            if not parents:
+                logger.warning("Could not find parent folder - dependencies cannot be downloaded")
+                return blend_path
+            
+            parent_folder_id = parents[0]
+            logger.info(f"Searching for {len(dependencies)} dependencies in parent folder...")
+            
+            try:
+                # Build a map of all files in the parent folder (and subfolders)
+                def map_folder_files(folder_id, current_path=""):
+                    """Build a map of filename -> file_id for all files in folder tree."""
+                    file_map = {}
+                    
+                    query = f"'{folder_id}' in parents and trashed=false"
+                    results = drive_service.files().list(
+                        q=query,
+                        fields="files(id, name, mimeType)",
+                        pageSize=1000,
+                        supportsAllDrives=True,
+                        includeItemsFromAllDrives=True
+                    ).execute()
+                    
+                    items = results.get('files', [])
+                    
+                    for item in items:
+                        item_name = item['name']
+                        item_id = item['id']
+                        item_type = item.get('mimeType', '')
+                        item_path = f"{current_path}/{item_name}" if current_path else item_name
+                        
+                        if item_type == 'application/vnd.google-apps.folder':
+                            # Recurse into subfolder
+                            subfolder_map = map_folder_files(item_id, item_path)
+                            file_map.update(subfolder_map)
+                        else:
+                            # Add file to map (both with and without path for matching)
+                            file_map[item_path] = (item_id, item_name)
+                            file_map[item_name] = (item_id, item_name)  # Also match just filename
+                    
+                    return file_map
+                
+                # Map all files in parent folder
+                logger.info("Mapping files in parent folder...")
+                file_map = map_folder_files(parent_folder_id)
+                logger.info(f"Found {len(file_map)} files/paths in Drive")
+                
+                # Download each dependency
+                downloaded_count = 0
+                for dep_path in dependencies:
+                    # Try to find this dependency in the file map
+                    found = False
+                    
+                    # Try exact path match first
+                    if dep_path in file_map:
+                        file_id, file_name = file_map[dep_path]
+                        found = True
+                    else:
+                        # Try just the filename
+                        dep_filename = os.path.basename(dep_path)
+                        if dep_filename in file_map:
+                            file_id, file_name = file_map[dep_filename]
+                            found = True
+                    
+                    if found:
+                        try:
+                            # Preserve folder structure from dependency path
+                            local_dep_path = os.path.join(project_dir, dep_path)
+                            os.makedirs(os.path.dirname(local_dep_path), exist_ok=True)
+                            
+                            logger.info(f"  Downloading: {dep_path}")
+                            file_request = drive_service.files().get_media(fileId=file_id)
+                            
+                            with open(local_dep_path, 'wb') as dep_fh:
+                                dep_downloader = MediaIoBaseDownload(dep_fh, file_request)
+                                dep_done = False
+                                while not dep_done:
+                                    dep_status, dep_done = dep_downloader.next_chunk()
+                            
+                            downloaded_count += 1
+                        except Exception as e:
+                            logger.warning(f"  Failed to download {dep_path}: {e}")
+                    else:
+                        logger.warning(f"  Dependency not found in Drive: {dep_path}")
+                
+                logger.info(f"Downloaded {downloaded_count}/{len(dependencies)} dependencies")
+                
+            except Exception as e:
+                logger.error(f"Error downloading dependencies: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+            
+            return blend_path
+        
+        else:
+            # Other file type, just return it
+            return temp_file
+            
+    except Exception as e:
+        logger.error(f"GDrive download error: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return False
+
+def delete_from_gdrive(file_id):
+    """Delete from Google Drive."""
+    if not packages_installed or not drive_service:
+        return False
+    try:
+        drive_service.files().delete(fileId=file_id).execute()
+        return True
+    except Exception as e:
+        logger.error(f"GDrive delete error: {e}")
+        return False
+
+def extract_id_from_link(drive_link):
+    """Extract file/folder ID from Google Drive link."""
+    import re
+    
+    # Folder: https://drive.google.com/drive/folders/FOLDER_ID
+    match = re.search(r'/folders/([a-zA-Z0-9_-]+)', drive_link)
+    if match:
+        return match.group(1), 'folder'
+    
+    # File: https://drive.google.com/file/d/FILE_ID/view
+    match = re.search(r'/file/d/([a-zA-Z0-9_-]+)', drive_link)
+    if match:
+        return match.group(1), 'file'
+    
+    # Open link: https://drive.google.com/open?id=ID
+    match = re.search(r'[?&]id=([a-zA-Z0-9_-]+)', drive_link)
+    if match:
+        return match.group(1), 'unknown'
+    
+    # Just an ID
+    if re.match(r'^[a-zA-Z0-9_-]+$', drive_link):
+        return drive_link, 'unknown'
+    
+    return None, None
+
+def list_files_in_shared_folder(folder_id_or_link):
+    """List files in a shared folder."""
+    if not packages_installed or not drive_service:
+        return []
+    
+    try:
+        file_id, link_type = extract_id_from_link(folder_id_or_link)
+        if not file_id:
+            logger.error("Invalid Drive link")
+            return []
+        
+        logger.info(f"Browsing: {file_id} (type: {link_type})")
+        
+        # Try to list files in the folder
+        query = f"'{file_id}' in parents and trashed=false and (name contains '.blend' or name contains '.zip')"
+        
+        results = drive_service.files().list(
+            q=query,
+            fields="files(id, name, mimeType, modifiedTime)",
+            pageSize=1000,
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True
+        ).execute()
+        
+        files = results.get('files', [])
+        logger.info(f"Found {len(files)} files in folder")
+        
+        return files
+        
+    except Exception as e:
+        logger.error(f"Error browsing shared folder: {e}")
+        return []
+
+#
+# BLENDER UI
+#
+
+class CloudStoragePreferences(bpy.types.AddonPreferences):
+    bl_idname = __name__
+
+    # S3 settings
+    access_key: bpy.props.StringProperty(name="AWS Access Key", default="", subtype='PASSWORD')
+    secret_key: bpy.props.StringProperty(name="AWS Secret Key", default="", subtype='PASSWORD')
+    region_name: bpy.props.StringProperty(name="AWS Region", default="us-west-2")
+    bucket_name: bpy.props.StringProperty(name="S3 Bucket Name", default="")
+    
+    # Google Drive settings
+    gdrive_client_id: bpy.props.StringProperty(name="Client ID", default="")
+    gdrive_client_secret: bpy.props.StringProperty(name="Client Secret", default="", subtype='PASSWORD')
+    gdrive_folder_id: bpy.props.StringProperty(name="Folder ID (optional)", default="")
+    gdrive_shared_link: bpy.props.StringProperty(
+        name="Shared Folder/File Link",
+        description="Paste a Google Drive share link to browse or download",
+        default=""
+    )
+    
+    storage_provider: bpy.props.EnumProperty(
+        name="Storage Provider",
+        items=[('S3', "AWS S3", ""), ('GDRIVE', "Google Drive", "")],
+        default='GDRIVE'
+    )
 
     def draw(self, context):
-        """Draw the panel UI."""
         layout = self.layout
         
         if not packages_installed:
-            layout.label(text="Required packages not installed!", icon='ERROR')
-            layout.label(text="Please restart Blender.")
+            layout.label(text="RESTART BLENDER to complete installation!", icon='ERROR')
             return
         
+        layout.prop(self, "storage_provider")
+        
+        if self.storage_provider == 'S3':
+            box = layout.box()
+            box.label(text="AWS S3 Settings", icon='SETTINGS')
+            box.prop(self, "access_key")
+            box.prop(self, "secret_key")
+            box.prop(self, "region_name")
+            box.prop(self, "bucket_name")
+        else:
+            box = layout.box()
+            box.label(text="Google Drive Settings", icon='SETTINGS')
+            box.prop(self, "gdrive_client_id")
+            box.prop(self, "gdrive_client_secret")
+            box.prop(self, "gdrive_folder_id")
+            
+            if is_gdrive_authenticated():
+                box.label(text="✓ Connected", icon='CHECKMARK')
+                box.operator("cloud.gdrive_disconnect", text="Disconnect")
+            else:
+                if self.gdrive_client_id and self.gdrive_client_secret:
+                    box.operator("cloud.gdrive_authenticate", text="Connect to Google Drive", icon='LINKED')
+
+class CloudStoragePanel(bpy.types.Panel):
+    bl_label = "Cloud Storage"
+    bl_idname = "OBJECT_PT_cloudstorage"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "Cloud"
+    # Removed bl_options = {'DEFAULT_CLOSED'} so panel stays open
+    bl_ui_units_x = 25  # Extra wide panel for long filenames (was 20)
+    
+    _first_draw = True  # Track if this is the first time drawing
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = False
+        layout.use_property_decorate = False
+        
+        if not packages_installed:
+            layout.label(text="RESTART BLENDER!", icon='ERROR')
+            return
+        
+        prefs = context.preferences.addons[__name__].preferences
         scene = context.scene
-        col = layout.column()
+        
+        layout.prop(prefs, "storage_provider", text="")
+        
+        if prefs.storage_provider == 'GDRIVE':
+            if not is_gdrive_authenticated():
+                layout.label(text="Not connected", icon='UNLINKED')
+                layout.label(text="Configure in Preferences")
+                return
+            
+            # Shared folder/file section
+            box = layout.box()
+            box.label(text="Browse Shared Folder/File:", icon='COMMUNITY')
+            row = box.row()
+            row.prop(prefs, "gdrive_shared_link", text="")
+            row.operator("cloud.browse_shared", text="Browse/Refresh", icon='FILE_REFRESH')
+        
+        # Auto-load files on first draw (if list is empty)
+        if len(scene.cloud_file_list) == 0 and CloudStoragePanel._first_draw:
+            CloudStoragePanel._first_draw = False
+            bpy.ops.cloud.update_list('INVOKE_DEFAULT')
+        
+        layout.separator()
+        
+        # File list - simple and clean
+        col = layout.column(align=True)
+        
+        if len(scene.cloud_file_list) == 0:
+            col.label(text="No files", icon='INFO')
+        else:
+            # Show files in boxes for clarity
+            for item in scene.cloud_file_list:
+                box = col.box()
+                box_col = box.column(align=True)
+                
+                # File name on its own row (full width, no wrapping)
+                row = box_col.row()
+                row.label(text=item.name, icon='FILE_BLEND')
+                
+                # Buttons on second row
+                row = box_col.row(align=True)
+                row.scale_y = 1.2
+                row.operator("cloud.load_file", text="Load", icon='IMPORT').file_id = item.file_id
+                row.operator("cloud.delete_file", text="Delete", icon='TRASH').file_id = item.file_id
+        
+        layout.separator()
+        
+        # Action buttons
+        row = layout.row(align=True)
+        row.scale_y = 1.3
+        row.operator("cloud.update_list", text="Refresh", icon='FILE_REFRESH')
+        row.operator("cloud.upload", text="Upload", icon='EXPORT')
 
-        # List all files in the scene's custom list
-        for item in scene.my_list:
-            row = col.row()
-            row.label(text=item.name)
-            row.operator("s3integration.load_file", text="Load").file_name = item.name
-            row.operator("s3integration.delete_file", text="Delete").file_name = item.name
-
-        layout.operator("scene.update_list", text="Update List")
-        layout.operator("s3integration.upload", text="Upload to S3")
-
-class MyPropGroup(bpy.types.PropertyGroup):
+class CloudFileItem(bpy.types.PropertyGroup):
     name: bpy.props.StringProperty()
+    file_id: bpy.props.StringProperty()
+
+#
+# OPERATORS
+#
+
+class GoogleDriveAuthenticateOperator(bpy.types.Operator):
+    bl_idname = "cloud.gdrive_authenticate"
+    bl_label = "Authenticate Google Drive"
+
+    def execute(self, context):
+        if not packages_installed:
+            self.report({'ERROR'}, "Restart Blender first")
+            return {'CANCELLED'}
+        
+        prefs = context.preferences.addons[__name__].preferences
+        
+        try:
+            client_config = {
+                "installed": {
+                    "client_id": prefs.gdrive_client_id,
+                    "client_secret": prefs.gdrive_client_secret,
+                    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                    "token_uri": "https://oauth2.googleapis.com/token",
+                    "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+                    "redirect_uris": ["http://localhost"]
+                }
+            }
+            
+            flow = InstalledAppFlow.from_client_config(client_config, SCOPES)
+            creds = flow.run_local_server(port=0)
+            
+            token_path = os.path.join(get_credentials_path(), "gdrive_token.pickle")
+            with open(token_path, 'wb') as token:
+                pickle.dump(creds, token)
+            
+            global drive_service
+            drive_service = build('drive', 'v3', credentials=creds)
+            
+            self.report({'INFO'}, "Connected to Google Drive!")
+            return {'FINISHED'}
+        except Exception as e:
+            logger.error(f"Auth error: {e}")
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
+
+class GoogleDriveDisconnectOperator(bpy.types.Operator):
+    bl_idname = "cloud.gdrive_disconnect"
+    bl_label = "Disconnect"
+
+    def execute(self, context):
+        try:
+            token_path = os.path.join(get_credentials_path(), "gdrive_token.pickle")
+            if os.path.exists(token_path):
+                os.remove(token_path)
+            global drive_service
+            drive_service = None
+            self.report({'INFO'}, "Disconnected")
+            return {'FINISHED'}
+        except Exception as e:
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
+
+class BrowseSharedOperator(bpy.types.Operator):
+    bl_idname = "cloud.browse_shared"
+    bl_label = "Browse Shared"
+    bl_description = "Browse files from a shared Google Drive folder or file link"
+
+    def execute(self, context):
+        if not packages_installed:
+            self.report({'ERROR'}, "Restart Blender")
+            return {'CANCELLED'}
+        
+        if not initialize_gdrive_service():
+            self.report({'ERROR'}, "Connect first")
+            return {'CANCELLED'}
+        
+        prefs = context.preferences.addons[__name__].preferences
+        shared_link = prefs.gdrive_shared_link.strip()
+        
+        if not shared_link:
+            self.report({'ERROR'}, "Paste a link first")
+            return {'CANCELLED'}
+        
+        try:
+            scene = context.scene
+            scene.cloud_file_list.clear()
+            
+            files = list_files_in_shared_folder(shared_link)
+            
+            if not files:
+                self.report({'WARNING'}, "No .blend or .zip files found")
+                return {'CANCELLED'}
+            
+            for file in files:
+                new_item = scene.cloud_file_list.add()
+                new_item.name = file['name']
+                new_item.file_id = file['id']
+            
+            self.report({'INFO'}, f"Found {len(files)} files")
+            return {'FINISHED'}
+            
+        except Exception as e:
+            logger.error(f"Browse error: {e}")
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
 
 class UpdateFileListOperator(bpy.types.Operator):
-    bl_idname = "scene.update_list"
+    bl_idname = "cloud.update_list"
     bl_label = "Update List"
 
     def execute(self, context):
-        """Update the scene's list of files from S3, showing only .blend files."""
         if not packages_installed:
-            self.report({'ERROR'}, "Required packages not installed. Please restart Blender.")
+            self.report({'ERROR'}, "Restart Blender")
             return {'CANCELLED'}
         
-        initialize_s3_client()  # Ensure S3 client is initialized
+        prefs = context.preferences.addons[__name__].preferences
         scene = context.scene
-
-        # Get all files from the S3 bucket
-        all_files = list_files_in_bucket(bpy.context.preferences.addons[__name__].preferences.bucket_name)
+        scene.cloud_file_list.clear()
         
-        # Filter to include only .blend files
-        blend_files = [file_name for file_name in all_files if file_name.endswith('.blend')]
-
-        # Clear the current list and populate it with filtered blend files
-        scene.my_list.clear()
-        for blend_file in blend_files:
-            blend_file = blend_file.split('/')[-1]  # Get only the filename
-            new_item = scene.my_list.add()
-            new_item.name = blend_file
-
-        return {'FINISHED'}
+        try:
+            if prefs.storage_provider == 'S3':
+                initialize_s3_client()
+                all_files = list_files_in_s3(prefs.bucket_name)
+                blend_files = [f for f in all_files if f.endswith('.blend')]
+                
+                for file_path in blend_files:
+                    new_item = scene.cloud_file_list.add()
+                    new_item.name = os.path.basename(file_path)
+                    new_item.file_id = file_path
+            else:
+                if not initialize_gdrive_service():
+                    self.report({'ERROR'}, "Connect first")
+                    return {'CANCELLED'}
+                
+                files = list_files_in_gdrive(prefs.gdrive_folder_id or None)
+                
+                for file in files:
+                    new_item = scene.cloud_file_list.add()
+                    new_item.name = file['name']
+                    new_item.file_id = file['id']
+            
+            self.report({'INFO'}, f"Found {len(scene.cloud_file_list)} files")
+            return {'FINISHED'}
+        except Exception as e:
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
 
 class UploadOperator(bpy.types.Operator):
-    bl_idname = "s3integration.upload"
-    bl_label = "Upload to S3"
+    bl_idname = "cloud.upload"
+    bl_label = "Upload"
 
     def execute(self, context):
-        """Upload the current Blender file to S3."""
         if not packages_installed:
-            self.report({'ERROR'}, "Required packages not installed. Please restart Blender.")
+            self.report({'ERROR'}, "Restart Blender")
             return {'CANCELLED'}
         
-        initialize_s3_client()  # Ensure S3 client is initialized
+        prefs = context.preferences.addons[__name__].preferences
         local_file_path = bpy.context.blend_data.filepath
         
         if not local_file_path:
-            self.report({'ERROR'}, "Please save your file before uploading.")
+            self.report({'ERROR'}, "Save file first (Ctrl+S)")
             return {'CANCELLED'}
         
-        s3_file_name = os.path.basename(local_file_path).replace(".blend", "")
-
-        # Gather dependencies and create a package directory
-        package_dir = gather_dependencies(local_file_path)
-
-        # Upload the package directory to S3 without zipping
-        success = upload_folder_to_s3(package_dir, bpy.context.preferences.addons[__name__].preferences.bucket_name, s3_file_name)
-
-        # Clean up: remove the temporary package directory after upload
-        shutil.rmtree(package_dir)
-
-        if success:
-            # Update the list of files in the panel after upload
-            bpy.ops.scene.update_list()
-            self.report({'INFO'}, "File uploaded successfully!")
-        else:
-            self.report({'ERROR'}, "Failed to upload file.")
-
-        return {'FINISHED'}
+        if not os.path.exists(local_file_path):
+            self.report({'ERROR'}, "File does not exist - save first")
+            return {'CANCELLED'}
+        
+        try:
+            if prefs.storage_provider == 'S3':
+                if not prefs.bucket_name:
+                    self.report({'ERROR'}, "Configure S3 bucket in preferences")
+                    return {'CANCELLED'}
+                
+                initialize_s3_client()
+                s3_file_name = os.path.basename(local_file_path).replace(".blend", "")
+                package_dir = gather_dependencies(local_file_path)
+                success = upload_to_s3(package_dir, prefs.bucket_name, s3_file_name)
+                shutil.rmtree(package_dir, ignore_errors=True)
+            else:
+                if not initialize_gdrive_service():
+                    self.report({'ERROR'}, "Connect to Google Drive first")
+                    return {'CANCELLED'}
+                
+                # Gather dependencies and upload as zip
+                package_dir = gather_dependencies(local_file_path)
+                success = upload_to_gdrive(package_dir, prefs.gdrive_folder_id or None)
+                shutil.rmtree(package_dir, ignore_errors=True)
+            
+            if success:
+                # Auto-refresh the file list
+                try:
+                    bpy.ops.cloud.update_list('EXEC_DEFAULT')
+                except:
+                    # If auto-refresh fails, just notify user
+                    logger.warning("Auto-refresh failed, click Refresh button")
+                
+                self.report({'INFO'}, "Upload complete!")
+            else:
+                self.report({'ERROR'}, "Upload failed - check console")
+            
+            return {'FINISHED'}
+        except Exception as e:
+            logger.error(f"Upload error: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            self.report({'ERROR'}, f"Upload failed: {str(e)[:50]}")
+            return {'CANCELLED'}
 
 class LoadFileOperator(bpy.types.Operator):
-    bl_idname = "s3integration.load_file"
-    bl_label = "Load File from S3"
+    bl_idname = "cloud.load_file"
+    bl_label = "Load File"
+    bl_description = "Download and open this file"
+    file_id: bpy.props.StringProperty()
 
-    file_name: bpy.props.StringProperty()
+    def invoke(self, context, event):
+        """Show confirmation dialog before loading."""
+        # Check if current file has unsaved changes
+        if bpy.data.is_dirty:
+            # Show popup menu with clear options
+            return context.window_manager.invoke_popup(self, width=400)
+        else:
+            # No unsaved changes, proceed directly
+            return self.execute(context)
+    
+    def draw(self, context):
+        """Draw the popup menu with clear button options."""
+        layout = self.layout
+        
+        # Warning header
+        box = layout.box()
+        row = box.row()
+        row.alert = True
+        row.label(text="⚠ UNSAVED CHANGES", icon='ERROR')
+        
+        layout.separator()
+        
+        # Explanation
+        col = layout.column(align=True)
+        col.label(text="Your current project has unsaved changes.")
+        col.label(text="Loading a new file will close it.")
+        
+        layout.separator()
+        layout.separator()
+        
+        # Three clear button options
+        col = layout.column(align=True)
+        col.scale_y = 1.5
+        
+        # Option 1: Save and Load (recommended)
+        row = col.row()
+        row.operator("cloud.save_and_load", text="💾 Save Current & Load New File", icon='FILE_TICK').file_id = self.file_id
+        
+        # Option 2: Discard and Load
+        row = col.row()
+        row.operator("cloud.discard_and_load", text="⚠ Discard Changes & Load New File", icon='CANCEL').file_id = self.file_id
+        
+        # Option 3: Cancel
+        row = col.row()
+        row.operator("cloud.cancel_load", text="❌ Cancel (Stay in Current File)", icon='BACK')
 
     def execute(self, context):
-        """Download and load the selected file from S3."""
+        """This should not be called directly when there are unsaved changes."""
         if not packages_installed:
-            self.report({'ERROR'}, "Required packages not installed. Please restart Blender.")
+            self.report({'ERROR'}, "Restart Blender")
             return {'CANCELLED'}
         
-        load_s3_file_into_blender(self.file_name)
+        # If we get here, there were no unsaved changes, so just load
+        prefs = context.preferences.addons[__name__].preferences
+        
+        try:
+            temp_dir = os.path.join(tempfile.gettempdir(), "blender_cloud")
+            os.makedirs(temp_dir, exist_ok=True)
+            
+            if prefs.storage_provider == 'S3':
+                initialize_s3_client()
+                downloaded_file = download_from_s3(prefs.bucket_name, self.file_id, temp_dir)
+            else:
+                if not initialize_gdrive_service():
+                    self.report({'ERROR'}, "Connect first")
+                    return {'CANCELLED'}
+                
+                downloaded_file = download_from_gdrive(self.file_id, temp_dir)
+            
+            if downloaded_file and os.path.exists(downloaded_file):
+                bpy.ops.wm.open_mainfile(filepath=downloaded_file)
+                self.report({'INFO'}, "Loaded!")
+            else:
+                self.report({'ERROR'}, "Download failed")
+            
+            return {'FINISHED'}
+        except Exception as e:
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
+
+class SaveAndLoadFileOperator(bpy.types.Operator):
+    bl_idname = "cloud.save_and_load"
+    bl_label = "Save Current & Load New File"
+    bl_description = "Save your current work, then load the cloud file"
+    file_id: bpy.props.StringProperty()
+
+    def execute(self, context):
+        # Save current file first
+        if bpy.data.filepath:
+            try:
+                bpy.ops.wm.save_mainfile()
+                self.report({'INFO'}, "Current file saved")
+            except Exception as e:
+                self.report({'ERROR'}, f"Failed to save: {e}")
+                return {'CANCELLED'}
+        else:
+            self.report({'ERROR'}, "Current file has never been saved. Use File → Save As first!")
+            return {'CANCELLED'}
+        
+        # Now load the cloud file
+        prefs = context.preferences.addons[__name__].preferences
+        
+        try:
+            temp_dir = os.path.join(tempfile.gettempdir(), "blender_cloud")
+            os.makedirs(temp_dir, exist_ok=True)
+            
+            if prefs.storage_provider == 'S3':
+                initialize_s3_client()
+                downloaded_file = download_from_s3(prefs.bucket_name, self.file_id, temp_dir)
+            else:
+                if not initialize_gdrive_service():
+                    self.report({'ERROR'}, "Connect first")
+                    return {'CANCELLED'}
+                
+                downloaded_file = download_from_gdrive(self.file_id, temp_dir)
+            
+            if downloaded_file and os.path.exists(downloaded_file):
+                bpy.ops.wm.open_mainfile(filepath=downloaded_file)
+                self.report({'INFO'}, "Loaded!")
+            else:
+                self.report({'ERROR'}, "Download failed")
+            
+            return {'FINISHED'}
+        except Exception as e:
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
+
+class DiscardAndLoadFileOperator(bpy.types.Operator):
+    bl_idname = "cloud.discard_and_load"
+    bl_label = "Discard Changes & Load New File"
+    bl_description = "Discard your current changes and load the cloud file"
+    file_id: bpy.props.StringProperty()
+
+    def execute(self, context):
+        # Just load without saving
+        prefs = context.preferences.addons[__name__].preferences
+        
+        try:
+            temp_dir = os.path.join(tempfile.gettempdir(), "blender_cloud")
+            os.makedirs(temp_dir, exist_ok=True)
+            
+            if prefs.storage_provider == 'S3':
+                initialize_s3_client()
+                downloaded_file = download_from_s3(prefs.bucket_name, self.file_id, temp_dir)
+            else:
+                if not initialize_gdrive_service():
+                    self.report({'ERROR'}, "Connect first")
+                    return {'CANCELLED'}
+                
+                downloaded_file = download_from_gdrive(self.file_id, temp_dir)
+            
+            if downloaded_file and os.path.exists(downloaded_file):
+                bpy.ops.wm.open_mainfile(filepath=downloaded_file)
+                self.report({'INFO'}, "Loaded!")
+            else:
+                self.report({'ERROR'}, "Download failed")
+            
+            return {'FINISHED'}
+        except Exception as e:
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
+
+class CancelLoadOperator(bpy.types.Operator):
+    bl_idname = "cloud.cancel_load"
+    bl_label = "Cancel"
+    bl_description = "Cancel loading and stay in current file"
+
+    def execute(self, context):
+        self.report({'INFO'}, "Load cancelled")
         return {'FINISHED'}
 
 class DeleteFileOperator(bpy.types.Operator):
-    bl_idname = "s3integration.delete_file"
-    bl_label = "Delete File from S3"
-
-    file_name: bpy.props.StringProperty()
+    bl_idname = "cloud.delete_file"
+    bl_label = "Delete"
+    file_id: bpy.props.StringProperty()
 
     def execute(self, context):
-        """Delete the selected file from S3."""
         if not packages_installed:
-            self.report({'ERROR'}, "Required packages not installed. Please restart Blender.")
+            self.report({'ERROR'}, "Restart Blender")
             return {'CANCELLED'}
         
-        initialize_s3_client()  # Ensure S3 client is initialized
-        success = delete_file_from_s3(bpy.context.preferences.addons[__name__].preferences.bucket_name, self.file_name)
+        prefs = context.preferences.addons[__name__].preferences
+        
+        try:
+            if prefs.storage_provider == 'S3':
+                initialize_s3_client()
+                success = delete_from_s3(prefs.bucket_name, self.file_id)
+            else:
+                if not initialize_gdrive_service():
+                    self.report({'ERROR'}, "Connect first")
+                    return {'CANCELLED'}
+                
+                success = delete_from_gdrive(self.file_id)
+            
+            if success:
+                # Auto-refresh the file list
+                try:
+                    bpy.ops.cloud.update_list('EXEC_DEFAULT')
+                except:
+                    logger.warning("Auto-refresh failed, click Refresh button")
+                
+                self.report({'INFO'}, "Deleted!")
+            else:
+                self.report({'ERROR'}, "Delete failed")
+            
+            return {'FINISHED'}
+        except Exception as e:
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
 
-        if success:
-            # Update the list of files in the panel after deletion
-            bpy.ops.scene.update_list()
-            self.report({'INFO'}, "File deleted successfully!")
-        else:
-            self.report({'ERROR'}, "Failed to delete file.")
+#
+# REGISTRATION
+#
 
-        return {'FINISHED'}
+# Handler to refresh file list after loading a file
+@bpy.app.handlers.persistent
+def refresh_after_load(dummy):
+    """Auto-refresh cloud file list after loading a file."""
+    def do_refresh():
+        try:
+            # Check if we're authenticated and refresh
+            prefs = bpy.context.preferences.addons.get(__name__)
+            if prefs and prefs.preferences:
+                if prefs.preferences.storage_provider == 'GDRIVE':
+                    if is_gdrive_authenticated():
+                        bpy.ops.cloud.update_list('EXEC_DEFAULT')
+                elif prefs.preferences.storage_provider == 'S3':
+                    bpy.ops.cloud.update_list('EXEC_DEFAULT')
+        except Exception as e:
+            # If refresh fails, no big deal
+            logger.debug(f"Auto-refresh after load failed: {e}")
+        return None  # Don't repeat timer
+    
+    # Use a timer to refresh after a short delay (let Blender settle)
+    bpy.app.timers.register(do_refresh, first_interval=1.0)
 
 def register():
-    bpy.utils.register_class(S3IntegrationPreferences)
-    bpy.utils.register_class(S3IntegrationPanel)
+    bpy.utils.register_class(CloudStoragePreferences)
+    bpy.utils.register_class(CloudStoragePanel)
+    bpy.utils.register_class(CloudFileItem)
+    bpy.utils.register_class(GoogleDriveAuthenticateOperator)
+    bpy.utils.register_class(GoogleDriveDisconnectOperator)
+    bpy.utils.register_class(BrowseSharedOperator)
     bpy.utils.register_class(UpdateFileListOperator)
     bpy.utils.register_class(UploadOperator)
     bpy.utils.register_class(LoadFileOperator)
+    bpy.utils.register_class(SaveAndLoadFileOperator)
+    bpy.utils.register_class(DiscardAndLoadFileOperator)
+    bpy.utils.register_class(CancelLoadOperator)
     bpy.utils.register_class(DeleteFileOperator)
-    bpy.utils.register_class(MyPropGroup)
-    bpy.types.Scene.my_list = bpy.props.CollectionProperty(type=MyPropGroup)
+    bpy.types.Scene.cloud_file_list = bpy.props.CollectionProperty(type=CloudFileItem)
+    
+    # Register load handler to auto-refresh after loading files
+    if refresh_after_load not in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.append(refresh_after_load)
 
 def unregister():
-    bpy.utils.unregister_class(S3IntegrationPreferences)
-    bpy.utils.unregister_class(S3IntegrationPanel)
+    bpy.utils.unregister_class(CloudStoragePreferences)
+    bpy.utils.unregister_class(CloudStoragePanel)
+    bpy.utils.unregister_class(CloudFileItem)
+    bpy.utils.unregister_class(GoogleDriveAuthenticateOperator)
+    bpy.utils.unregister_class(GoogleDriveDisconnectOperator)
+    bpy.utils.unregister_class(BrowseSharedOperator)
     bpy.utils.unregister_class(UpdateFileListOperator)
     bpy.utils.unregister_class(UploadOperator)
     bpy.utils.unregister_class(LoadFileOperator)
+    bpy.utils.unregister_class(SaveAndLoadFileOperator)
+    bpy.utils.unregister_class(DiscardAndLoadFileOperator)
+    bpy.utils.unregister_class(CancelLoadOperator)
     bpy.utils.unregister_class(DeleteFileOperator)
-    bpy.utils.unregister_class(MyPropGroup)
-    del bpy.types.Scene.my_list
+    del bpy.types.Scene.cloud_file_list
+    
+    # Unregister load handler
+    if refresh_after_load in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(refresh_after_load)
 
 if __name__ == "__main__":
     register()

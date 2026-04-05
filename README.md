@@ -88,6 +88,8 @@ After the first restart, Blender will start normally and the addon will work ins
 - ✅ **AWS S3 support** - Upload to your S3 bucket
 - ✅ **Google Drive support** - Upload to your Google Drive
 - ✅ **Browse shared folders** - Access files others have shared with you
+- ✅ **Optional render upload** - Include rendered images/videos in your upload
+- ✅ **Optional simulation cache upload** - Include physics/fluid cache files in your upload
 - ✅ **Cross-platform** - Works on Windows, macOS, Linux
 - ✅ **All Blender versions** - Supports Blender 3.0 through 5.x and beyond
 
@@ -166,7 +168,7 @@ After restart:
    - Test users: Add your email
    - Click **"Save and Continue"** until done
 4. Back to "Create Credentials":
-   - Application type: **Desktop app**
+   - Application type: **Desktop app** (⚠️ **CRITICAL: Do NOT choose "Web application"**)
    - Name: "Blender Cloud Storage"
    - Click **"Create"**
 5. **Copy the Client ID and Client Secret** - you'll need these!
@@ -180,13 +182,13 @@ After restart:
 5. Paste your **Client Secret**
 6. *(Optional)* Enter a **Folder ID** if you want to use a specific folder
 7. Click **"Connect to Google Drive"**
-8. Browser will open asking for permissions:
-   ```
-   Blender Cloud Storage wants to:
-   See, edit, create, and delete all of your Google Drive files
-   ```
-9. Click **"Allow"**
-10. Return to Blender - you should see **"✓ Connected"**
+8. Browser will open asking for permissions.
+9. **⚠️ IMPORTANT:** You will see a warning saying *"Google hasn't verified this app"*. This is normal for apps you run yourself!
+   - Click **"Advanced"** (at the bottom)
+   - Click **"Go to Blender Cloud Storage (unsafe)"** (or whatever you named your app)
+10. Check the boxes to allow access to your Google Drive files.
+11. Click **"Continue"** / **"Allow"**
+12. Return to Blender - you should see **"✓ Connected"**
 
 **Note:** The addon needs full Drive access to see your existing files and shared folders.
 
@@ -286,16 +288,45 @@ After restart:
 
 1. **Save your .blend file** (Ctrl+S)
 2. Press **N** in 3D Viewport → **Cloud** tab
-3. Click **"Upload"**
-4. Wait for upload to complete
-5. Done! Your file + all dependencies are uploaded
+3. *(Optional)* Check **"Include Render Outputs"** and/or **"Include Simulation Cache"** under Upload Options
+4. Click **"Upload"**
+5. Wait for upload to complete
+6. Done! Your file + all dependencies are uploaded
 
-**What gets uploaded:**
+**What gets uploaded (always):**
 - Your .blend file
 - All textures
 - All linked libraries
 - All referenced images
 - Everything packaged as a .zip file
+
+**Optional extras (via checkboxes):**
+- **Render Outputs** — rendered images/videos from the scene's output path (PNG, EXR, JPG, MP4, etc.)
+- **Simulation Cache** — physics and fluid cache files (`.bphys`, `.vdb`, `.abc`, `.uni`, etc.)
+
+> **Note:** Both checkboxes are **unchecked by default** to keep uploads fast and small. Enable them only when you need to share or back up those files.
+
+---
+
+### Upload Options
+
+The **Upload Options** box appears in the Cloud panel above the Upload button. It contains two checkboxes:
+
+| Checkbox | What it includes | When to use |
+|---|---|---|
+| **Include Render Outputs** | Rendered frames and videos from the scene's render output path | When you want to share or back up completed renders |
+| **Include Simulation Cache** | Physics, fluid, cloth, and particle cache files | When you want to preserve baked simulations so they don't need to be re-baked |
+
+**Render outputs** are gathered from the path set in **Properties → Output → Output Path** (the same path Blender writes to when you press F12/Ctrl+F12). Files are placed in a `renders/` folder inside the upload package.
+
+**Simulation cache** is gathered from:
+- The default `blendcache_<filename>` directory next to your .blend file
+- Custom cache paths set on particle systems, cloth, soft body, and rigid body modifiers
+- Fluid/Mantaflow domain cache directories
+
+Cache files are placed in a `sim_cache/` folder inside the upload package, preserving their relative directory structure.
+
+**Works with both AWS S3 and Google Drive** — the checkboxes apply regardless of which storage provider you've selected.
 
 ---
 
@@ -504,6 +535,20 @@ rm ~/.config/blender/[VERSION]/scripts/addons/cloud_storage_data/.packages_v3
 
 ---
 
+### "Error 400: redirect_uri_mismatch"
+
+**If you see an error about Google's OAuth 2.0 policy and redirect_uri:**
+
+**Cause:** You likely chose "Web application" instead of "Desktop app" when creating your credentials.
+
+**Solution:**
+1. Go to Google Cloud Console -> Credentials
+2. Either create a new OAuth Client ID and choose **"Desktop app"** (Recommended)
+3. OR, if you keep your "Web application", add `http://localhost:8080/` to your **Authorized redirect URIs** in the console.
+4. **Restart Blender** so the addon uses the correct port setting.
+
+---
+
 ### "Import failed: No module named 'google'"
 
 **The packages didn't install properly.**
@@ -671,6 +716,13 @@ When uploading projects, always use the **"Upload"** button in the addon:
 - ✅ Preserves folder structure
 - ✅ Easy to download and use
 
+### Include Renders & Caches Only When Needed
+The **"Include Render Outputs"** and **"Include Simulation Cache"** checkboxes are off by default for good reason:
+- 🎯 **Renders** can be very large (especially EXR sequences or video files)
+- 🎯 **Simulation caches** can take up gigabytes of space
+- 💡 Only check these when you specifically need to share or back up those files
+- 💡 For iterative work, leave them off to keep uploads fast
+
 ### Organize with Folders
 Use the **"Folder ID"** feature to organize your work:
 - Create folders like "Active Projects", "Archive", "Assets"
@@ -711,6 +763,8 @@ The addon automatically installs:
 **Upload:**
 - Creates a zip file containing your .blend + all dependencies
 - Preserves folder structure
+- Optionally includes render outputs in a `renders/` subfolder
+- Optionally includes simulation cache files in a `sim_cache/` subfolder
 - Uploads to cloud
 
 **Download:**
@@ -718,6 +772,7 @@ The addon automatically installs:
 - Extracts to temp directory
 - Opens .blend file
 - Dependencies automatically reconnected
+- Render outputs and simulation caches (if included) are extracted alongside dependencies
 
 ### Storage Location
 

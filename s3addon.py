@@ -23,10 +23,11 @@ import platform
 # Setup logging
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
-handler = logging.StreamHandler()
-formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-handler.setFormatter(formatter)
-logger.addHandler(handler)
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
 
 # Platform detection
 PLATFORM = platform.system()  # 'Windows', 'Darwin' (macOS), or 'Linux'
@@ -82,11 +83,82 @@ def mark_packages_installed():
     with open(get_install_flag_path(), 'w') as f:
         f.write("v3.0")
 
+def _run_pip_check():
+    """Check if pip is available via sys.executable."""
+    result = subprocess.run(
+        [sys.executable, "-m", "pip", "--version"],
+        capture_output=True, text=True
+    )
+    return result.returncode == 0
+
+def ensure_pip():
+    """Ensure pip is available, trying multiple methods.
+    
+    Works across all platforms and Python configurations:
+    - Blender's bundled Python (all versions)
+    - System Python on Linux/macOS/Windows
+    - Python installs without pip or ensurepip wheels
+    """
+    # Method 1: pip already available
+    try:
+        if _run_pip_check():
+            logger.info("✓ pip is available")
+            return True
+    except Exception:
+        pass
+    
+    # Method 2: ensurepip (standard library, but may lack bundled wheel on some distros)
+    logger.info("pip not found — trying ensurepip...")
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "ensurepip", "--upgrade"],
+            capture_output=True, text=True
+        )
+        if result.returncode == 0 and _run_pip_check():
+            logger.info("✓ pip installed via ensurepip")
+            return True
+        else:
+            logger.warning(f"ensurepip did not succeed: {result.stderr.strip()}")
+    except Exception as e:
+        logger.warning(f"ensurepip not available: {e}")
+    
+    # Method 3: Download get-pip.py (works when ensurepip is broken/missing)
+    logger.info("Trying to download get-pip.py from bootstrap.pypa.io...")
+    try:
+        import urllib.request
+        get_pip_path = os.path.join(tempfile.gettempdir(), "get-pip.py")
+        urllib.request.urlretrieve(
+            "https://bootstrap.pypa.io/get-pip.py",
+            get_pip_path
+        )
+        
+        # Try without --break-system-packages first, then with it (PEP 668 / Debian)
+        for extra_args in [[], ["--break-system-packages"]]:
+            cmd = [sys.executable, get_pip_path] + extra_args
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode == 0 and _run_pip_check():
+                logger.info("✓ pip installed via get-pip.py")
+                return True
+        
+        logger.warning(f"get-pip.py failed: {result.stderr.strip()}")
+    except Exception as e:
+        logger.warning(f"get-pip.py download/install failed: {e}")
+    
+    logger.error("All methods to install pip have failed")
+    return False
+
 def install_packages(modules_path):
     """Install all required packages."""
     logger.info("=" * 60)
     logger.info("INSTALLING PACKAGES")
     logger.info("=" * 60)
+    
+    # Ensure pip is available (Blender 5.x / some distros may not ship it)
+    if not ensure_pip():
+        logger.error("Cannot install packages — pip is not available")
+        logger.error("Please install pip manually: python -m ensurepip --upgrade")
+        logger.error("  Or on Debian/Ubuntu: sudo apt install python3-pip python3.14-venv")
+        return False
     
     try:
         # Install all packages in one command
@@ -94,6 +166,13 @@ def install_packages(modules_path):
         
         logger.info("Running: " + " ".join(cmd))
         result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        # If it fails due to PEP 668 externally-managed-environment, retry with flag
+        if result.returncode != 0 and "externally-managed-environment" in result.stderr:
+            logger.info("Retrying with --break-system-packages (PEP 668)...")
+            cmd = [sys.executable, "-m", "pip", "install", "--target", modules_path,
+                   "--upgrade", "--break-system-packages"] + REQUIRED_PACKAGES
+            result = subprocess.run(cmd, capture_output=True, text=True)
         
         if result.returncode == 0:
             logger.info("=" * 60)
@@ -230,7 +309,111 @@ def initialize_gdrive_service():
     drive_service = build('drive', 'v3', credentials=creds)
     return True
 
-def gather_dependencies(blend_file_path):
+def gather_render_outputs():
+    """Gather render output files from the current scene's output path."""
+    render_files = []
+    try:
+        output_path = bpy.path.abspath(bpy.context.scene.render.filepath)
+        if not output_path:
+            logger.info("No render output path set")
+            return render_files
+        
+        # output_path may be a directory or a file prefix
+        output_dir = output_path if os.path.isdir(output_path) else os.path.dirname(output_path)
+        file_prefix = "" if os.path.isdir(output_path) else os.path.basename(output_path)
+        
+        if not os.path.isdir(output_dir):
+            logger.info(f"Render output directory does not exist: {output_dir}")
+            return render_files
+        
+        # Common render output extensions
+        render_extensions = {
+            '.png', '.jpg', '.jpeg', '.exr', '.tiff', '.tif', '.bmp',
+            '.hdr', '.dpx', '.cin', '.webp',
+            '.mp4', '.avi', '.mov', '.mkv',
+        }
+        
+        for root, dirs, files in os.walk(output_dir):
+            for f in files:
+                if file_prefix and not f.startswith(file_prefix):
+                    continue
+                ext = os.path.splitext(f)[1].lower()
+                if ext in render_extensions:
+                    render_files.append(os.path.join(root, f))
+        
+        logger.info(f"Found {len(render_files)} render output files in {output_dir}")
+    except Exception as e:
+        logger.error(f"Error gathering render outputs: {e}")
+    return render_files
+
+
+def gather_simulation_cache():
+    """Gather simulation/physics cache files from the blend file's cache directory."""
+    cache_files = []
+    try:
+        blend_path = bpy.context.blend_data.filepath
+        if not blend_path:
+            return cache_files
+        
+        base_dir = os.path.dirname(blend_path)
+        
+        # Blender stores caches in blendcache_<filename> by default
+        blend_name = os.path.splitext(os.path.basename(blend_path))[0]
+        default_cache_dir = os.path.join(base_dir, f"blendcache_{blend_name}")
+        
+        # Collect from the default bake/cache directory
+        cache_dirs_to_scan = set()
+        if os.path.isdir(default_cache_dir):
+            cache_dirs_to_scan.add(default_cache_dir)
+        
+        # Also scan for custom cache directories set on point caches
+        for obj in bpy.data.objects:
+            # Particle systems
+            for ps in obj.particle_systems:
+                cache = ps.point_cache
+                if cache.use_disk_cache:
+                    cache_path = bpy.path.abspath(cache.filepath) if cache.filepath else ""
+                    if cache_path and os.path.isdir(os.path.dirname(cache_path)):
+                        cache_dirs_to_scan.add(os.path.dirname(cache_path))
+            
+            # Rigid body (world level)
+            # Cloth, fluid, soft body modifiers
+            for mod in obj.modifiers:
+                if hasattr(mod, 'point_cache'):
+                    cache = mod.point_cache
+                    if cache.use_disk_cache:
+                        cache_path = bpy.path.abspath(cache.filepath) if cache.filepath else ""
+                        if cache_path and os.path.isdir(os.path.dirname(cache_path)):
+                            cache_dirs_to_scan.add(os.path.dirname(cache_path))
+                # Fluid simulation (Mantaflow)
+                if mod.type == 'FLUID':
+                    if mod.fluid_type in ('DOMAIN',) and hasattr(mod, 'domain_settings') and mod.domain_settings:
+                        cache_dir = bpy.path.abspath(mod.domain_settings.cache_directory)
+                        if cache_dir and os.path.isdir(cache_dir):
+                            cache_dirs_to_scan.add(cache_dir)
+        
+        # Walk cache directories and collect files
+        cache_extensions = {
+            '.bphys', '.bobj.gz', '.obj.gz', '.gz',
+            '.uni', '.vdb', '.openvdb',
+            '.abc', '.pc2', '.mdd',
+        }
+        
+        for cache_dir in cache_dirs_to_scan:
+            for root, dirs, files in os.walk(cache_dir):
+                for f in files:
+                    ext = os.path.splitext(f)[1].lower()
+                    # Handle double extensions like .bobj.gz
+                    if f.lower().endswith('.bobj.gz') or f.lower().endswith('.obj.gz') or ext in cache_extensions:
+                        cache_files.append(os.path.join(root, f))
+        
+        logger.info(f"Found {len(cache_files)} simulation cache files")
+    except Exception as e:
+        logger.error(f"Error gathering simulation cache: {e}")
+    return cache_files
+
+
+def gather_dependencies(blend_file_path, include_renders=False, include_sim_cache=False):
     """Gather all dependencies for a blend file."""
     base_dir = os.path.dirname(blend_file_path)
     package_dir_name = "package_" + os.path.basename(blend_file_path).split('.')[0]
@@ -256,6 +439,37 @@ def gather_dependencies(blend_file_path):
         dep_dest = os.path.join(package_dir, rel_path)
         os.makedirs(os.path.dirname(dep_dest), exist_ok=True)
         shutil.copy(dep, dep_dest)
+    
+    # Optionally include render outputs
+    if include_renders:
+        render_files = gather_render_outputs()
+        if render_files:
+            renders_dest = os.path.join(package_dir, "renders")
+            os.makedirs(renders_dest, exist_ok=True)
+            for rf in render_files:
+                try:
+                    dest = os.path.join(renders_dest, os.path.basename(rf))
+                    shutil.copy(rf, dest)
+                except Exception as e:
+                    logger.warning(f"Could not copy render file {rf}: {e}")
+            logger.info(f"Included {len(render_files)} render output files")
+    
+    # Optionally include simulation cache
+    if include_sim_cache:
+        cache_files = gather_simulation_cache()
+        if cache_files:
+            cache_dest = os.path.join(package_dir, "sim_cache")
+            os.makedirs(cache_dest, exist_ok=True)
+            for cf in cache_files:
+                try:
+                    # Preserve relative directory structure within cache
+                    rel = os.path.relpath(cf, base_dir)
+                    dest = os.path.join(cache_dest, rel)
+                    os.makedirs(os.path.dirname(dest), exist_ok=True)
+                    shutil.copy(cf, dest)
+                except Exception as e:
+                    logger.warning(f"Could not copy cache file {cf}: {e}")
+            logger.info(f"Included {len(cache_files)} simulation cache files")
     
     return package_dir
 
@@ -299,15 +513,44 @@ def upload_to_s3(folder, bucket, s3_key):
         return False
 
 def download_from_s3(bucket, s3_key, local_dir):
-    """Download from S3."""
+    """Download project folder from S3, including all dependencies."""
     if not packages_installed:
         return False
     try:
-        file_name = os.path.basename(s3_key)
-        local_file_path = os.path.join(local_dir, file_name)
-        os.makedirs(os.path.dirname(local_file_path), exist_ok=True)
-        s3_client.download_file(bucket, s3_key, local_file_path)
-        return local_file_path
+        # Determine the project prefix (folder) from the s3_key
+        # Upload stores files as: project_name/file.blend, project_name/textures/img.png, etc.
+        if '/' in s3_key:
+            prefix = s3_key.rsplit('/', 1)[0] + '/'
+        else:
+            prefix = s3_key
+        
+        prefs = bpy.context.preferences.addons[__name__].preferences
+        s3_resource = boto3.resource(
+            's3',
+            aws_access_key_id=prefs.access_key,
+            aws_secret_access_key=prefs.secret_key,
+            region_name=prefs.region_name
+        )
+        my_bucket = s3_resource.Bucket(bucket)
+        
+        blend_file = None
+        downloaded_count = 0
+        
+        for obj in my_bucket.objects.filter(Prefix=prefix):
+            # Skip "directory" markers
+            if obj.key.endswith('/'):
+                continue
+            
+            local_file_path = os.path.join(local_dir, obj.key)
+            os.makedirs(os.path.dirname(local_file_path), exist_ok=True)
+            s3_client.download_file(bucket, obj.key, local_file_path)
+            downloaded_count += 1
+            
+            if obj.key.endswith('.blend'):
+                blend_file = local_file_path
+        
+        logger.info(f"Downloaded {downloaded_count} files from S3 prefix: {prefix}")
+        return blend_file if blend_file else False
     except Exception as e:
         logger.error(f"S3 download error: {e}")
         return False
@@ -415,29 +658,27 @@ def upload_to_gdrive(file_path, folder_id=None):
     """Upload file to Google Drive as zip."""
     if not packages_installed or not drive_service:
         return False
+    zip_path = None
     try:
         import zipfile
-        import io
         
-        # If it's a folder, zip it
+        # If it's a folder, zip it to a temp file (avoids loading entire zip into RAM)
         if os.path.isdir(file_path):
-            zip_buffer = io.BytesIO()
-            with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+            zip_name = os.path.basename(file_path) + ".zip"
+            zip_path = os.path.join(tempfile.gettempdir(), zip_name)
+            
+            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zip_file:
                 for root, dirs, files in os.walk(file_path):
                     for file in files:
                         file_path_full = os.path.join(root, file)
                         arcname = os.path.relpath(file_path_full, file_path)
                         zip_file.write(file_path_full, arcname)
             
-            zip_buffer.seek(0)
-            zip_name = os.path.basename(file_path) + ".zip"
-            
             file_metadata = {'name': zip_name, 'mimeType': 'application/zip'}
             if folder_id:
                 file_metadata['parents'] = [folder_id]
             
-            from googleapiclient.http import MediaIoBaseUpload
-            media = MediaIoBaseUpload(zip_buffer, mimetype='application/zip', resumable=True)
+            media = MediaFileUpload(zip_path, mimetype='application/zip', resumable=True)
             drive_service.files().create(body=file_metadata, media_body=media, fields='id').execute()
             return True
         else:
@@ -452,11 +693,12 @@ def upload_to_gdrive(file_path, folder_id=None):
     except Exception as e:
         logger.error(f"GDrive upload error: {e}")
         return False
+    finally:
+        if zip_path and os.path.exists(zip_path):
+            os.remove(zip_path)
 
 def extract_dependencies_from_blend(blend_path):
     """Extract actual dependency paths from a .blend file."""
-    import struct
-    
     dependencies = set()
     
     try:
@@ -479,60 +721,70 @@ def extract_dependencies_from_blend(blend_path):
                 logger.error("Not a valid .blend file")
                 return dependencies
             
-            # Read the rest of the file and look for file paths
-            # Blender stores paths as null-terminated strings
-            content = f.read()
-            
-            # Look for common path patterns
-            # Images/textures typically have extensions
-            import re
-            
             # Find paths with common extensions
             extensions = [
                 b'.png', b'.jpg', b'.jpeg', b'.tga', b'.tiff', b'.exr', b'.hdr',
                 b'.mp4', b'.mov', b'.avi', b'.blend'
             ]
             
-            for ext in extensions:
-                # Find all occurrences of this extension
-                pos = 0
-                while True:
-                    pos = content.find(ext, pos)
-                    if pos == -1:
+            # Read and scan in chunks to avoid loading entire file into memory
+            CHUNK_SIZE = 10 * 1024 * 1024  # 10MB
+            MAX_PATH_LEN = 512  # Must exceed the 500-char path length limit below
+            
+            def _extract_path_at(data, ext_pos, ext):
+                """Extract and validate a file path ending at ext_pos."""
+                start = ext_pos
+                while start > 0 and data[start-1:start] not in [b'\x00', b'\n', b'\r']:
+                    start -= 1
+                    if ext_pos - start > 500:
                         break
+                
+                path_bytes = data[start:ext_pos + len(ext)]
+                try:
+                    path = path_bytes.decode('utf-8', errors='ignore')
+                    path = path.strip('\x00\n\r\t ')
                     
-                    # Try to extract the full path before this extension
-                    # Look backwards to find the start of the path
-                    start = pos
-                    while start > 0 and content[start-1:start] not in [b'\x00', b'\n', b'\r']:
-                        start -= 1
-                        if pos - start > 500:  # Reasonable path length limit
+                    if len(path) > 3 and ('/' in path or '\\' in path):
+                        path = path.replace('\\', '/')
+                        if path.startswith('//'):
+                            return path[2:]  # Blender relative path
+                        elif not path.startswith('/') and ':' not in path:
+                            return path
+                except (UnicodeDecodeError, ValueError):
+                    pass
+                return None
+            
+            prev_tail = b''
+            while True:
+                chunk = f.read(CHUNK_SIZE)
+                if not chunk:
+                    break
+                
+                data = prev_tail + chunk
+                is_last_chunk = len(chunk) < CHUNK_SIZE
+                
+                for ext in extensions:
+                    pos = 0
+                    while True:
+                        pos = data.find(ext, pos)
+                        if pos == -1:
                             break
-                    
-                    # Extract the path
-                    path_bytes = content[start:pos + len(ext)]
-                    try:
-                        path = path_bytes.decode('utf-8', errors='ignore')
-                        # Clean up the path
-                        path = path.strip('\x00\n\r\t ')
                         
-                        # Filter out obviously invalid paths
-                        if len(path) > 3 and '/' in path or '\\' in path:
-                            # Normalize path separators
-                            path = path.replace('\\', '/')
-                            
-                            # Extract just the filename and relative path
-                            # Skip absolute paths, keep relative ones
-                            if not path.startswith('/') and ':' not in path:
-                                dependencies.add(path)
-                            elif path.startswith('//'):
-                                # Blender relative path
-                                dependencies.add(path[2:])  # Remove //
-                    except (UnicodeDecodeError, ValueError):
-                        # Invalid path data, skip it
-                        pass
-                    
-                    pos += 1
+                        # Skip matches in the tail region — next iteration will catch them
+                        if not is_last_chunk and pos >= len(data) - MAX_PATH_LEN:
+                            pos += 1
+                            continue
+                        
+                        result = _extract_path_at(data, pos, ext)
+                        if result:
+                            dependencies.add(result)
+                        
+                        pos += 1
+                
+                # Keep tail for overlap with next chunk
+                if is_last_chunk:
+                    break
+                prev_tail = chunk[-MAX_PATH_LEN:] if len(chunk) >= MAX_PATH_LEN else chunk
         
         logger.info(f"Extracted {len(dependencies)} dependencies from .blend file:")
         for dep in sorted(dependencies):
@@ -623,32 +875,40 @@ def download_from_gdrive(file_id, local_dir):
                 def map_folder_files(folder_id, current_path=""):
                     """Build a map of filename -> file_id for all files in folder tree."""
                     file_map = {}
+                    page_token = None
                     
                     query = f"'{folder_id}' in parents and trashed=false"
-                    results = drive_service.files().list(
-                        q=query,
-                        fields="files(id, name, mimeType)",
-                        pageSize=1000,
-                        supportsAllDrives=True,
-                        includeItemsFromAllDrives=True
-                    ).execute()
                     
-                    items = results.get('files', [])
-                    
-                    for item in items:
-                        item_name = item['name']
-                        item_id = item['id']
-                        item_type = item.get('mimeType', '')
-                        item_path = f"{current_path}/{item_name}" if current_path else item_name
+                    while True:
+                        results = drive_service.files().list(
+                            q=query,
+                            fields="nextPageToken, files(id, name, mimeType)",
+                            pageSize=1000,
+                            pageToken=page_token,
+                            supportsAllDrives=True,
+                            includeItemsFromAllDrives=True
+                        ).execute()
                         
-                        if item_type == 'application/vnd.google-apps.folder':
-                            # Recurse into subfolder
-                            subfolder_map = map_folder_files(item_id, item_path)
-                            file_map.update(subfolder_map)
-                        else:
-                            # Add file to map (both with and without path for matching)
-                            file_map[item_path] = (item_id, item_name)
-                            file_map[item_name] = (item_id, item_name)  # Also match just filename
+                        items = results.get('files', [])
+                        
+                        for item in items:
+                            item_name = item['name']
+                            item_id = item['id']
+                            item_type = item.get('mimeType', '')
+                            item_path = f"{current_path}/{item_name}" if current_path else item_name
+                            
+                            if item_type == 'application/vnd.google-apps.folder':
+                                # Recurse into subfolder
+                                subfolder_map = map_folder_files(item_id, item_path)
+                                file_map.update(subfolder_map)
+                            else:
+                                # Add file to map (both with and without path for matching)
+                                file_map[item_path] = (item_id, item_name)
+                                file_map[item_name] = (item_id, item_name)  # Also match just filename
+                        
+                        page_token = results.get('nextPageToken')
+                        if not page_token:
+                            break
                     
                     return file_map
                 
@@ -763,18 +1023,28 @@ def list_files_in_shared_folder(folder_id_or_link):
         
         logger.info(f"Browsing: {file_id} (type: {link_type})")
         
-        # Try to list files in the folder
+        # List files in the folder with pagination
         query = f"'{file_id}' in parents and trashed=false and (name contains '.blend' or name contains '.zip')"
         
-        results = drive_service.files().list(
-            q=query,
-            fields="files(id, name, mimeType, modifiedTime)",
-            pageSize=1000,
-            supportsAllDrives=True,
-            includeItemsFromAllDrives=True
-        ).execute()
+        files = []
+        page_token = None
         
-        files = results.get('files', [])
+        while True:
+            results = drive_service.files().list(
+                q=query,
+                fields="nextPageToken, files(id, name, mimeType, modifiedTime)",
+                pageSize=1000,
+                pageToken=page_token,
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True
+            ).execute()
+            
+            files.extend(results.get('files', []))
+            page_token = results.get('nextPageToken')
+            
+            if not page_token:
+                break
+        
         logger.info(f"Found {len(files)} files in folder")
         
         return files
@@ -849,7 +1119,6 @@ class CloudStoragePanel(bpy.types.Panel):
     bl_region_type = 'UI'
     bl_category = "Cloud"
     # Removed bl_options = {'DEFAULT_CLOSED'} so panel stays open
-    bl_ui_units_x = 25  # Extra wide panel for long filenames (was 20)
     
     _first_draw = True  # Track if this is the first time drawing
 
@@ -910,6 +1179,15 @@ class CloudStoragePanel(bpy.types.Panel):
         
         layout.separator()
         
+        # Upload options
+        box = layout.box()
+        box.label(text="Upload Options:", icon='PREFERENCES')
+        col = box.column(align=True)
+        col.prop(scene, "cloud_include_renders")
+        col.prop(scene, "cloud_include_sim_cache")
+        
+        layout.separator()
+        
         # Action buttons
         row = layout.row(align=True)
         row.scale_y = 1.3
@@ -927,6 +1205,7 @@ class CloudFileItem(bpy.types.PropertyGroup):
 class GoogleDriveAuthenticateOperator(bpy.types.Operator):
     bl_idname = "cloud.gdrive_authenticate"
     bl_label = "Authenticate Google Drive"
+    bl_description = "Connect to your Google Drive account via OAuth"
 
     def execute(self, context):
         if not packages_installed:
@@ -948,7 +1227,7 @@ class GoogleDriveAuthenticateOperator(bpy.types.Operator):
             }
             
             flow = InstalledAppFlow.from_client_config(client_config, SCOPES)
-            creds = flow.run_local_server(port=0)
+            creds = flow.run_local_server(port=8080)
             
             token_path = os.path.join(get_credentials_path(), "gdrive_token.pickle")
             with open(token_path, 'wb') as token:
@@ -1028,6 +1307,7 @@ class BrowseSharedOperator(bpy.types.Operator):
 class UpdateFileListOperator(bpy.types.Operator):
     bl_idname = "cloud.update_list"
     bl_label = "Update List"
+    bl_description = "Refresh the list of files from cloud storage"
 
     def execute(self, context):
         if not packages_installed:
@@ -1069,6 +1349,7 @@ class UpdateFileListOperator(bpy.types.Operator):
 class UploadOperator(bpy.types.Operator):
     bl_idname = "cloud.upload"
     bl_label = "Upload"
+    bl_description = "Upload the current .blend file with all dependencies to cloud storage"
 
     def execute(self, context):
         if not packages_installed:
@@ -1086,7 +1367,12 @@ class UploadOperator(bpy.types.Operator):
             self.report({'ERROR'}, "File does not exist - save first")
             return {'CANCELLED'}
         
+        package_dir = None
         try:
+            scene = context.scene
+            include_renders = scene.cloud_include_renders
+            include_sim_cache = scene.cloud_include_sim_cache
+            
             if prefs.storage_provider == 'S3':
                 if not prefs.bucket_name:
                     self.report({'ERROR'}, "Configure S3 bucket in preferences")
@@ -1094,18 +1380,16 @@ class UploadOperator(bpy.types.Operator):
                 
                 initialize_s3_client()
                 s3_file_name = os.path.basename(local_file_path).replace(".blend", "")
-                package_dir = gather_dependencies(local_file_path)
+                package_dir = gather_dependencies(local_file_path, include_renders, include_sim_cache)
                 success = upload_to_s3(package_dir, prefs.bucket_name, s3_file_name)
-                shutil.rmtree(package_dir, ignore_errors=True)
             else:
                 if not initialize_gdrive_service():
                     self.report({'ERROR'}, "Connect to Google Drive first")
                     return {'CANCELLED'}
                 
                 # Gather dependencies and upload as zip
-                package_dir = gather_dependencies(local_file_path)
+                package_dir = gather_dependencies(local_file_path, include_renders, include_sim_cache)
                 success = upload_to_gdrive(package_dir, prefs.gdrive_folder_id or None)
-                shutil.rmtree(package_dir, ignore_errors=True)
             
             if success:
                 # Auto-refresh the file list
@@ -1126,6 +1410,9 @@ class UploadOperator(bpy.types.Operator):
             logger.error(traceback.format_exc())
             self.report({'ERROR'}, f"Upload failed: {str(e)[:50]}")
             return {'CANCELLED'}
+        finally:
+            if package_dir and os.path.exists(package_dir):
+                shutil.rmtree(package_dir, ignore_errors=True)
 
 class LoadFileOperator(bpy.types.Operator):
     bl_idname = "cloud.load_file"
@@ -1307,7 +1594,11 @@ class CancelLoadOperator(bpy.types.Operator):
 class DeleteFileOperator(bpy.types.Operator):
     bl_idname = "cloud.delete_file"
     bl_label = "Delete"
+    bl_description = "Permanently delete this file from cloud storage"
     file_id: bpy.props.StringProperty()
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_confirm(self, event)
 
     def execute(self, context):
         if not packages_installed:
@@ -1384,6 +1675,16 @@ def register():
     bpy.utils.register_class(CancelLoadOperator)
     bpy.utils.register_class(DeleteFileOperator)
     bpy.types.Scene.cloud_file_list = bpy.props.CollectionProperty(type=CloudFileItem)
+    bpy.types.Scene.cloud_include_renders = bpy.props.BoolProperty(
+        name="Include Render Outputs",
+        description="Include rendered images/videos from the output path in the upload",
+        default=False
+    )
+    bpy.types.Scene.cloud_include_sim_cache = bpy.props.BoolProperty(
+        name="Include Simulation Cache",
+        description="Include physics and fluid simulation cache files in the upload",
+        default=False
+    )
     
     # Register load handler to auto-refresh after loading files
     if refresh_after_load not in bpy.app.handlers.load_post:
@@ -1404,6 +1705,8 @@ def unregister():
     bpy.utils.unregister_class(CancelLoadOperator)
     bpy.utils.unregister_class(DeleteFileOperator)
     del bpy.types.Scene.cloud_file_list
+    del bpy.types.Scene.cloud_include_renders
+    del bpy.types.Scene.cloud_include_sim_cache
     
     # Unregister load handler
     if refresh_after_load in bpy.app.handlers.load_post:
